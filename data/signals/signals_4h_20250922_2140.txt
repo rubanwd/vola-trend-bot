@@ -1,0 +1,13 @@
+CONFIRMED CANDLE PATTERNS — TF=4h — 2025-09-22T21:40:26+03:00
+01. UXLINK/USDT:USDT | BEAR | RSI=4.0 | Three Black Crows
+02. CAMP/USDT:USDT | BEAR | RSI=21.2 | Three Black Crows
+03. USELESS/USDT:USDT | BEAR | RSI=21.8 | Three Outside Down
+04. FHE/USDT:USDT | BEAR | RSI=22.7 | Three Black Crows
+05. TOWNS/USDT:USDT | BEAR | RSI=23.5 | Three Black Crows
+06. 1000TAG/USDT:USDT | BEAR | RSI=23.7 | Three Black Crows
+07. HOLO/USDT:USDT | BEAR | RSI=24.6 | Three Black Crows
+08. TAC/USDT:USDT | BEAR | RSI=25.1 | Three Black Crows
+09. XPIN/USDT:USDT | BEAR | RSI=27.1 | Tweezer Top, Three Black Crows
+10. IN/USDT:USDT | BEAR | RSI=28.6 | Three Black Crows
+11. XNY/USDT:USDT | BEAR | RSI=28.8 | Bearish Engulfing, Tweezer Top, Bearish Kicker
+12. MASA/USDT:USDT | BEAR | RSI=28.9 | Evening Star
