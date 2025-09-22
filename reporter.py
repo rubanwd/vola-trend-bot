@@ -2,10 +2,36 @@ from pathlib import Path
 from typing import List, Dict
 from utils import now_iso
 
+def _kv(k, v, kpad=18):
+    return f"{k:<{kpad}} : {v}"
+
+def build_params_table(params: Dict) -> str:
+    lines = []
+    lines.append("PARAMS")
+    lines.append("-" * 40)
+    ordered = [
+        ("WORK_TF", params.get("WORK_TF")),
+        ("VOL_TF", params.get("VOL_TF")),
+        ("TREND_TF1", params.get("TREND_TF1")),
+        ("TREND_TF2", params.get("TREND_TF2")),
+        ("TOP_N_BY_VOL", params.get("TOP_N_BY_VOL")),
+        ("RSI_LEN", params.get("RSI_LEN")),
+        ("RSI_OVERBOUGHT", params.get("RSI_OVERBOUGHT")),
+        ("RSI_OVERSOLD", params.get("RSI_OVERSOLD")),
+        ("ATR_LEN", params.get("ATR_LEN")),
+        ("ANOMALY_FILTER", params.get("ANOMALY_FILTER_ENABLED")),
+        ("MAX_24H_ABS_%", params.get("MAX_24H_ABS_CHANGE_PCT")),
+        ("MAX_7D_ABS_%", params.get("MAX_7D_ABS_CHANGE_PCT")),
+    ]
+    for k, v in ordered:
+        lines.append(_kv(k, v))
+    return "\n".join(lines)
+
 def build_report_txt(cycle_info: Dict, bull_list: List[Dict], bear_list: List[Dict]) -> str:
     lines = []
     lines.append(f"VOLATILITY/TREND/RSI SCAN — {now_iso()}")
-    lines.append(f"TF(work)={cycle_info['work_tf']} | VOL_TF={cycle_info['vol_tf']} | Trend TFs={cycle_info['trend_tfs']}")
+    lines.append(build_params_table(cycle_info["params"]))
+    lines.append("")
     lines.append(f"Universe: top {cycle_info['top_n']} by ATR% on {cycle_info['vol_tf']}")
     lines.append("")
 
