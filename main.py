@@ -80,19 +80,18 @@ def find_patterns(df: pd.DataFrame, trend: str) -> List[str]:
     if trend == "BULL":
         for name, fn in BULL_PATTERNS.items():
             try:
-                if fn(df):
+                if fn(df, trend_hint="BULL"):
                     pats.append(name)
             except Exception:
                 continue
     elif trend == "BEAR":
         for name, fn in BEAR_PATTERNS.items():
             try:
-                if fn(df):
+                if fn(df, trend_hint="BEAR"):
                     pats.append(name)
             except Exception:
                 continue
     return pats
-
 
 def cycle_once(exchange, logger, data_dir: Path):
     logger.info("=== Новый цикл ===")
