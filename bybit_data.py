@@ -1,65 +1,42 @@
-# bybit_data.py
 import ccxt
-import pandas as pd
-from typing import List
+from typing import List, Dict
 from settings import Settings
 
 def build_exchange():
-    """
-    Возвращает инстанс ccxt.<exchange> с нужными опциями для Bybit.
-    MARKET_TYPE: 'spot' или 'swap' (USDT-perp). По умолчанию 'swap'.
-    """
     if not hasattr(ccxt, Settings.EXCHANGE):
         raise RuntimeError(f"Unknown exchange in ccxt: {Settings.EXCHANGE}")
-
     exchange_class = getattr(ccxt, Settings.EXCHANGE)
     exchange = exchange_class({
         "enableRateLimit": True,
-        "options": {
-            # важно для Bybit: выбираем тип рынка по умолчанию
-            "defaultType": Settings.MARKET_TYPE,   # 'spot' | 'swap'
-        }
+        "options": {"defaultType": Settings.MARKET_TYPE}
     })
-
-    # загрузим рынки один раз
     exchange.load_markets()
     return exchange
 
-def list_symbols_usdt(exchange) -> List[str]:
-    """
-    Возвращает список активных символов к QUOTE (по умолчанию USDT),
-    фильтруя опционы/инверсные/неактивные рынки.
-    """
-    out: List[str] = []
-    for sym, m in exchange.markets.items():
-        if not m.get("active", True):
-            continue
-        if m.get("quote") != Settings.QUOTE:
-            continue
-        if m.get("option", False):
-            continue
-        t = m.get("type")
-        # оставляем только указанный тип (spot/swap)
-        if t != Settings.MARKET_TYPE:
-            continue
-        out.append(sym)
-    return sorted(set(out))
+def _is_symbol_ok(mkt: dict) -> bool:
+    if not mkt.get("active", True): return False
+    if mkt.get("quote") != Settings.QUOTE: return False
+    if mkt.get("option", False): return False
+    if mkt.get("type") != Settings.MARKET_TYPE: return False
+    return True
 
-def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
+def fetch_top_by_volatility_24h(exchange) -> List[Dict]:
     """
-    Загружает OHLCV и возвращает DataFrame с колонками:
-    ts, open, high, low, close, volume
+    Быстрое формирование universe через tickers:
+    vol24h_pct = (high24h - low24h) / last * 100
+    Возвращает список словарей: {"symbol", "vol24h_pct"}
     """
-    if not exchange.has.get("fetchOHLCV", False):
-        raise RuntimeError(f"{exchange.id} has no fetchOHLCV")
-
-    # ccxt иногда может кинуть эксепшн при слишком большом лимите
-    limit = max(50, min(1000, int(limit)))
-
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    if not ohlcv or len(ohlcv) == 0:
-        raise RuntimeError(f"Empty OHLCV for {symbol} {timeframe}")
-
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    return df
+    tickers = exchange.fetch_tickers()  # единоразово
+    rows = []
+    for sym, t in tickers.items():
+        m = exchange.markets.get(sym)
+        if not m or not _is_symbol_ok(m): 
+            continue
+        last = t.get("last")
+        high = t.get("high")
+        low  = t.get("low")
+        if last and high and low and last > 0:
+            vol_pct = float((high - low) / last * 100.0)
+            rows.append({"symbol": sym, "vol24h_pct": vol_pct})
+    rows.sort(key=lambda x: x["vol24h_pct"], reverse=True)
+    return rows[:Settings.TOP_N_BY_VOL]

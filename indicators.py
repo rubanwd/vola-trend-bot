@@ -13,20 +13,10 @@ def rsi(close: pd.Series, length: int = 14) -> pd.Series:
     rs = roll_up / (roll_dn + 1e-12)
     return 100 - (100 / (1 + rs))
 
-def atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
-    high, low, close = df["high"], df["low"], df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/length, adjust=False).mean()
-
-def slope(series: pd.Series, length: int = 5) -> float:
-    if len(series) < length: return 0.0
-    y = series.iloc[-length:].values
-    x = np.arange(length)
-    # нормируем на цену, чтобы сравнивать
-    coef = np.polyfit(x, y, 1)[0]
-    return float(coef)
+def macd(close: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    line = ema_fast - ema_slow
+    signal_line = line.ewm(span=signal, adjust=False).mean()
+    hist = line - signal_line
+    return line, signal_line, hist

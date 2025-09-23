@@ -10,18 +10,36 @@ class Settings:
 
     # Таймфреймы
     WORK_TF       = os.getenv("WORK_TF", "1h")
-    VOL_TF        = os.getenv("VOL_TF", "1d")
-    TREND_TF1     = os.getenv("TREND_TF1", "4h")
-    TREND_TF2     = os.getenv("TREND_TF2", "1d")
+    VOL_TF        = os.getenv("VOL_TF", "1d")          # для отчёта
 
-    # RSI
+    # Индикаторы
     RSI_LEN       = int(os.getenv("RSI_LEN", 14))
-    RSI_OVERBOUGHT= float(os.getenv("RSI_OVERBOUGHT", 70))
-    RSI_OVERSOLD  = float(os.getenv("RSI_OVERSOLD", 30))
+    RSI_OVERBOUGHT= float(os.getenv("RSI_OVERBOUGHT", 70))   # normal-mode
+    RSI_OVERSOLD  = float(os.getenv("RSI_OVERSOLD", 30))     # normal-mode
+    RSI_RELAXED_OVERBOUGHT = float(os.getenv("RSI_RELAXED_OVERBOUGHT", 65))
+    RSI_RELAXED_OVERSOLD   = float(os.getenv("RSI_RELAXED_OVERSOLD", 35))
 
-    # Волатильность
-    ATR_LEN       = int(os.getenv("ATR_LEN", 14))
+    EMA_FAST      = int(os.getenv("EMA_FAST", 50))
+    EMA_SLOW      = int(os.getenv("EMA_SLOW", 200))
+
+    MACD_FAST     = int(os.getenv("MACD_FAST", 12))
+    MACD_SLOW     = int(os.getenv("MACD_SLOW", 26))
+    MACD_SIGNAL   = int(os.getenv("MACD_SIGNAL", 9))
+
+    # Топ по суточной волатильности (через tickers)
     TOP_N_BY_VOL  = int(os.getenv("TOP_N_BY_VOL", 100))
+
+    # Режим строгости паттернов/порогов: normal | relaxed | debug
+    RELAX_MODE    = os.getenv("RELAX_MODE", "debug").lower()
+
+    # Режим подтверждения индикаторов: auto | all | any | two_of_three
+    # auto: debug->any, normal/relaxed->all
+    CONFIRM_MODE  = os.getenv("CONFIRM_MODE", "auto").lower()
+
+    # Включение/выключение индикаторов
+    ENABLE_RSI    = os.getenv("ENABLE_RSI", "true").lower() == "true"
+    ENABLE_EMA    = os.getenv("ENABLE_EMA", "true").lower() == "true"
+    ENABLE_MACD   = os.getenv("ENABLE_MACD", "true").lower() == "true"
 
     # Периодичность
     ITER_SECONDS  = int(os.getenv("ITER_SECONDS", 1800))
