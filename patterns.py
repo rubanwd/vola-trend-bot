@@ -437,18 +437,6 @@ BULL_PATTERNS: Dict[str, Callable] = {
     "Bullish Three Line Strike": three_line_strike_bull,
     "Three Inside Up":   three_inside_up,
     "Three Outside Up":  three_outside_up,
-    # # новые single
-    # "Hammer":            hammer,
-    # "Inverted Hammer":   inverted_hammer,
-    # "Doji":              doji,
-    # "Dragonfly Doji":    dragonfly_doji,
-    # "Bullish Marubozu":  bullish_marubozu,
-    # # двухсвечные новые
-    # "Doji Star (Bullish)": doji_star_bullish,
-    # # continuation
-    # "Rising Three Methods": rising_three_methods,
-    # # уровни
-    # "Matching Low":      matching_low,
 }
 
 BEAR_PATTERNS: Dict[str, Callable] = {
@@ -463,16 +451,4 @@ BEAR_PATTERNS: Dict[str, Callable] = {
     "Bearish Three Line Strike": three_line_strike_bear,
     "Three Inside Down": three_inside_down,
     "Three Outside Down": three_outside_down,
-    # # новые single
-    # "Hanging Man":       hanging_man,
-    # "Shooting Star":     shooting_star,
-    # "Doji":              doji,
-    # "Gravestone Doji":   gravestone_doji,
-    # "Bearish Marubozu":  bearish_marubozu,
-    # # двухсвечные новые
-    # "Doji Star (Bearish)": doji_star_bearish,
-    # # continuation
-    # "Falling Three Methods": falling_three_methods,
-    # # уровни
-    # "Matching High":     matching_high,
 }

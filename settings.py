@@ -57,3 +57,23 @@ class Settings:
     ANOMALY_FILTER_ENABLED = os.getenv("ANOMALY_FILTER_ENABLED", "true").lower() == "true"
     MAX_24H_ABS_CHANGE_PCT = float(os.getenv("MAX_24H_ABS_CHANGE_PCT", 80))
     MAX_7D_ABS_CHANGE_PCT  = float(os.getenv("MAX_7D_ABS_CHANGE_PCT", 300))
+
+
+    # --- BYBIT trading ---
+    BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
+    BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+    BYBIT_BASE = os.getenv("BYBIT_BASE", "https://api-demo.bybit.com")
+
+    MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", 3))
+    POSITION_USD = float(os.getenv("POSITION_USD", 100))
+    LEVERAGE = int(os.getenv("LEVERAGE", 10))
+
+    ATR_LEN = int(os.getenv("ATR_LEN", 14))
+    SL_ATR_MULT = float(os.getenv("SL_ATR_MULT", 1.8))
+    TP_ATR_MULT = float(os.getenv("TP_ATR_MULT", 3.0))
+
+    REENTRY_COOLDOWN_HOURS = int(os.getenv("REENTRY_COOLDOWN_HOURS", 24))
+
+    TG_TRADE_BOT_TOKEN = os.getenv("TG_TRADE_BOT_TOKEN", "")
+    TG_TRADE_CHAT_ID = os.getenv("TG_TRADE_CHAT_ID", "")
+

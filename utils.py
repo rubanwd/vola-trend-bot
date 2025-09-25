@@ -51,3 +51,12 @@ def write_jsonl(path, obj):
 
 def sleep_until_next_cycle(seconds):
     time.sleep(seconds)
+
+def ensure_dirs(base="./data"):
+    base = Path(base)
+    (base / "logs").mkdir(parents=True, exist_ok=True)
+    (base / "reports").mkdir(parents=True, exist_ok=True)
+    (base / "signals").mkdir(parents=True, exist_ok=True)
+    (base / "state").mkdir(parents=True, exist_ok=True)   # <-- ДОБАВЛЕНО
+    return base
+
