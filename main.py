@@ -1,7 +1,5 @@
 # main.py
-import os
 import json
-import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
@@ -19,7 +17,7 @@ from bybit_api import BybitAPI
 
 
 # =========================
-# OHLCV helpers
+# OHLCV helpers (через ccxt для маркет-данных)
 # =========================
 def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=min(max(limit, 50), 1000))
@@ -56,18 +54,21 @@ def evaluate_indicators(close: pd.Series, direction: str) -> Dict[str, bool]:
         _, _, hist = macd(close, Settings.MACD_FAST, Settings.MACD_SLOW, Settings.MACD_SIGNAL)
         if len(hist) >= 2:
             h1, h2 = float(hist.iloc[-2]), float(hist.iloc[-1])
-            ok = (h2 > h1) if Settings.RELAX_MODE in ("relaxed", "debug") else (h2 >= 0)
-            if direction == "BEAR":
-                ok = (h2 < h1) if Settings.RELAX_MODE in ("relaxed", "debug") else (h2 <= 0)
+            if Settings.RELAX_MODE in ("relaxed", "debug"):
+                ok = (h2 > h1) if direction == "BULL" else (h2 < h1)
+            else:
+                ok = (h2 >= 0) if direction == "BULL" else (h2 <= 0)
             checks["MACD"] = bool(ok)
         else:
             checks["MACD"] = False
+
     return checks
 
 
 def indicators_pass(checks: Dict[str, bool]) -> bool:
     if not checks:
         return True
+
     vals = [bool(v) for v in checks.values()]
     true_cnt = sum(vals)
     enabled_cnt = len(vals)
@@ -98,7 +99,7 @@ def find_patterns(df: pd.DataFrame, direction: str) -> List[str]:
 
 
 # =========================
-# Trading helpers (state, Bybit ops)
+# State helpers (храним «последние сигналы»)
 # =========================
 def _state_file(data_dir: Path) -> Path:
     return data_dir / "state" / "last_signals.json"
@@ -124,6 +125,9 @@ def _signal_key(sig: Dict) -> str:
     return f"{sig['symbol']}|{sig['direction']}"
 
 
+# =========================
+# Trading helpers (Bybit)
+# =========================
 def count_open_positions(bybit: BybitAPI) -> int:
     try:
         pos = bybit.get_open_positions()
@@ -148,23 +152,6 @@ def last_closed_age_hours(bybit: BybitAPI, bybit_symbol: str) -> float:
         return 9999.0
 
 
-def compute_atr_levels(df: pd.DataFrame, atr_len: int, sl_k: float, tp_k: float, side: str, entry_price: float):
-    a = float(atr(df, atr_len).iloc[-1])
-    if side == "Buy":
-        sl = entry_price - sl_k * a
-        tp = entry_price + tp_k * a
-    else:
-        sl = entry_price + sl_k * a
-        tp = entry_price - tp_k * a
-    return a, sl, tp
-
-
-def usd_to_qty(bybit: BybitAPI, bybit_symbol: str, usd: float) -> float:
-    last = bybit.get_last_price(bybit_symbol)
-    raw_qty = usd / last
-    return bybit.round_qty(bybit_symbol, raw_qty)
-
-
 def open_trade_if_ok(
     bybit: BybitAPI,
     logger,
@@ -172,11 +159,10 @@ def open_trade_if_ok(
     new_sigs: List[Dict],
     df_cache: Dict[str, pd.DataFrame],
     market_id_map: Dict[str, str],
+    pos_mode: str,
 ):
     """
-    new_sigs: только новые сигналы этой итерации (symbol, direction, rsi, patterns, checks)
-    df_cache: кэш df по WORK_TF (для ATR)
-    market_id_map: ccxt symbol -> bybit v5 symbol (e.g., 'BTC/USDT:USDT' -> 'BTCUSDT')
+    Открываем сделки по «новым» сигналам с лимитами, ATR SL/TP и анти-реэнтри.
     """
     if not new_sigs:
         return
@@ -187,64 +173,74 @@ def open_trade_if_ok(
         logger.info("Лимит позиций достигнут (%d). Входы пропущены.", Settings.MAX_OPEN_POSITIONS)
         return
 
+    hedge = (pos_mode == "HEDGE")
+
     for sig in new_sigs[:slots_left]:
         ccxt_symbol = sig["symbol"]
         bybit_symbol = market_id_map.get(ccxt_symbol) or ccxt_symbol.replace("/", "").replace(":USDT", "")
         direction = sig["direction"]
         side = "Buy" if direction == "BULL" else "Sell"
+        position_idx = 1 if (hedge and side == "Buy") else (2 if hedge and side == "Sell" else 0)
 
-        # анти-реэнтри по bybit_symbol
+        # анти-реэнтри по закрытым позициям
         age_h = last_closed_age_hours(bybit, bybit_symbol)
         if age_h < Settings.REENTRY_COOLDOWN_HOURS:
             logger.info("Cooldown по %s: %.1fч < %dч — пропускаем.", bybit_symbol, age_h, Settings.REENTRY_COOLDOWN_HOURS)
             continue
 
-        # плечо
+        # плечо (best-effort)
         try:
             bybit.set_leverage(bybit_symbol, Settings.LEVERAGE)
         except Exception as e:
             logger.warning("set_leverage %s: %s (продолжаем)", bybit_symbol, e)
 
-        # qty из USD
+        # qty (строка, квантизировано)
         try:
-            qty = usd_to_qty(bybit, bybit_symbol, Settings.POSITION_USD)
+            last = bybit.get_last_price(bybit_symbol)
+            raw_qty = Settings.POSITION_USD / last
+            qty_str = bybit.round_qty(bybit_symbol, raw_qty)
         except Exception as e:
             logger.error("Не удалось посчитать qty для %s: %s", bybit_symbol, e)
             continue
 
-        # ATR уровни
+        # ATR уровни и цены (строки)
         df = df_cache.get(ccxt_symbol)
         if df is None or len(df) < 20:
             logger.info("Нет df в кэше для %s — пропуск", ccxt_symbol)
             continue
 
         try:
-            entry_ref = bybit.get_last_price(bybit_symbol)
-            atr_val, sl_price, tp_price = compute_atr_levels(
-                df, Settings.ATR_LEN, Settings.SL_ATR_MULT, Settings.TP_ATR_MULT, side, entry_ref
-            )
-            sl_price = bybit.round_price(bybit_symbol, sl_price)
-            tp_price = bybit.round_price(bybit_symbol, tp_price)
+            a = float(atr(df, Settings.ATR_LEN).iloc[-1])
+            entry_ref = last  # реф.цена для расчёта уровней
+            if side == "Buy":
+                sl_f = entry_ref - Settings.SL_ATR_MULT * a
+                tp_f = entry_ref + Settings.TP_ATR_MULT * a
+            else:
+                sl_f = entry_ref + Settings.SL_ATR_MULT * a
+                tp_f = entry_ref - Settings.TP_ATR_MULT * a
+
+            sl_str = bybit.round_price(bybit_symbol, sl_f)
+            tp_str = bybit.round_price(bybit_symbol, tp_f)
         except Exception as e:
             logger.error("ATR/levels error %s: %s", bybit_symbol, e)
             continue
 
-        # Маркет-вход
+        # Маркет-вход с корректным positionIdx
         try:
-            bybit.place_market_order(bybit_symbol, side, qty)
-            logger.info("Открыта позиция: %s %s qty=%s", bybit_symbol, side, qty)
+            bybit.place_market_order(bybit_symbol, side, qty_str, position_idx=position_idx)
+            logger.info("Открыта позиция: %s %s qty=%s (idx=%d)", bybit_symbol, side, qty_str, position_idx)
         except Exception as e:
             logger.error("Не удалось открыть позицию %s %s: %s", bybit_symbol, side, e)
             continue
 
         # TP/SL на позицию
         try:
-            bybit.set_tp_sl(bybit_symbol, take_profit=tp_price, stop_loss=sl_price)
-            logger.info("TP/SL проставлены: TP=%s SL=%s", tp_price, sl_price)
+            bybit.set_tp_sl(bybit_symbol, take_profit=tp_str, stop_loss=sl_str, position_idx=position_idx)
+            logger.info("TP/SL проставлены: TP=%s SL=%s (idx=%d)", tp_str, sl_str, position_idx)
         except Exception as e:
             logger.warning("Не удалось проставить TP/SL для %s: %s", bybit_symbol, e)
 
-        # Телега (уведомление о сделке)
+        # Telegram уведомление о сделке
         if Settings.TG_TRADE_BOT_TOKEN and Settings.TG_TRADE_CHAT_ID:
             try:
                 pats = ", ".join(sig.get("patterns", [])) or "-"
@@ -253,16 +249,17 @@ def open_trade_if_ok(
                 text = (
                     "✅ ОТКРЫТА СДЕЛКА\n"
                     f"Пара: {ccxt_symbol} (Bybit: {bybit_symbol})\n"
+                    f"Режим позиций: {pos_mode} (idx={position_idx})\n"
                     f"Направление: {'LONG' if side=='Buy' else 'SHORT'}\n"
-                    f"Объём: ${Settings.POSITION_USD} (~ qty {qty}) | Плечо x{Settings.LEVERAGE}\n"
+                    f"Объём: ${Settings.POSITION_USD} (~ qty {qty_str}) | Плечо x{Settings.LEVERAGE}\n"
                     f"Entry≈: {entry_ref}\n"
-                    f"SL: {sl_price} | TP: {tp_price}\n"
-                    f"ATR({Settings.ATR_LEN}): {atr_val:.4f}\n"
+                    f"SL: {sl_str} | TP: {tp_str}\n"
+                    f"ATR({Settings.ATR_LEN}): {a:.4f}\n"
                     f"TF: {Settings.WORK_TF}\n"
                     f"Паттерны: {pats}\n"
                     f"Индикаторы: {flags}\n"
                     f"RSI: {sig.get('rsi'):.1f}\n"
-                    f"Условие входа: новая пара в списке сигналов; cooldown {Settings.REENTRY_COOLDOWN_HOURS}ч"
+                    f"Условие: новая пара; cooldown {Settings.REENTRY_COOLDOWN_HOURS}ч"
                 )
                 send_text(Settings.TG_TRADE_BOT_TOKEN, Settings.TG_TRADE_CHAT_ID, text)
             except Exception as e:
@@ -270,7 +267,7 @@ def open_trade_if_ok(
 
 
 # =========================
-# Optional: anomaly filter
+# Optional: anomaly filter (пампы/дампы)
 # =========================
 def pass_anomaly_filter(exchange, symbol: str) -> bool:
     if not Settings.ANOMALY_FILTER_ENABLED:
@@ -290,26 +287,24 @@ def pass_anomaly_filter(exchange, symbol: str) -> bool:
 
 
 # =========================
-# The main cycle
+# Основной цикл
 # =========================
-def cycle_once(exchange, logger, data_dir: Path, bybit: BybitAPI):
+def cycle_once(exchange, logger, data_dir: Path, bybit: BybitAPI, pos_mode: str):
     logger.info("=== Новый цикл ===")
     universe_rows = fetch_top_by_volatility_24h(exchange)
     universe_symbols = [r["symbol"] for r in universe_rows]
-    logger.info("Universe (top %d by 24h vol): %s",
-                len(universe_rows),
-                ", ".join(universe_symbols[:10]) + (" ..." if len(universe_symbols) > 10 else ""))
+    logger.info(
+        "Universe (top %d by 24h vol): %s",
+        len(universe_rows),
+        ", ".join(universe_symbols[:10]) + (" ..." if len(universe_symbols) > 10 else "")
+    )
 
-    # Построим маппинг ccxt -> bybit (важно для всех торговых вызовов)
+    # ccxt symbol -> bybit v5 symbol
     market_id_map: Dict[str, str] = {}
     for sym in universe_symbols:
-        try:
-            # наиболее корректно: использовать id из описания рынка
-            m = exchange.markets.get(sym) or {}
-            bybit_symbol = m.get("id") or sym.replace("/", "").replace(":USDT", "")
-            market_id_map[sym] = bybit_symbol
-        except Exception:
-            market_id_map[sym] = sym.replace("/", "").replace(":USDT", "")
+        m = exchange.markets.get(sym) or {}
+        bybit_symbol = m.get("id") or sym.replace("/", "").replace(":USDT", "")
+        market_id_map[sym] = bybit_symbol
 
     signals: List[Dict] = []
     df_cache: Dict[str, pd.DataFrame] = {}
@@ -355,7 +350,7 @@ def cycle_once(exchange, logger, data_dir: Path, bybit: BybitAPI):
         except Exception as e:
             logger.warning("Ошибка по %s: %s", sym, e)
 
-    # Новые сигналы
+    # Новые сигналы против прошлой итерации
     prev = load_last_signals(data_dir)
     prev_keys = {_signal_key(s) for s in prev}
     curr_keys = {_signal_key(s) for s in signals}
@@ -364,14 +359,14 @@ def cycle_once(exchange, logger, data_dir: Path, bybit: BybitAPI):
 
     # Торговля
     try:
-        open_trade_if_ok(bybit, logger, data_dir, new_sigs, df_cache, market_id_map)
+        open_trade_if_ok(bybit, logger, data_dir, new_sigs, df_cache, market_id_map, pos_mode)
     except Exception as e:
         logger.exception("Trade pipeline error: %s", e)
 
-    # Сохранить текущие сигналы
+    # Сохраняем текущее состояние сигналов
     save_last_signals(data_dir, signals)
 
-    # Репорты
+    # Отчёты / файлы / телега
     report_txt = build_report_txt(
         cycle_info={"top_n": Settings.TOP_N_BY_VOL,
                     "params": {
@@ -433,13 +428,17 @@ def cycle_once(exchange, logger, data_dir: Path, bybit: BybitAPI):
 def main():
     data_dir = ensure_dirs(Settings.DATA_DIR)
     logger = setup_logger("vola-trend-bot")
-    exchange = build_exchange()  # ccxt для маркет-данных
-    bybit = BybitAPI()          # прямой Bybit v5 (demo) для торговли
+    exchange = build_exchange()   # ccxt для маркет-данных
+    bybit = BybitAPI()            # прямой Bybit v5 для торговли
 
+    # прогрев шагов цены/лота
     try:
-        bybit.get_instruments()  # прогрев шагов цены/лота
+        bybit.get_instruments()
     except Exception as e:
         logger.warning("Не удалось прогреть инструменты Bybit: %s", e)
+
+    pos_mode = bybit.get_position_mode()
+    logger.info("Режим позиций Bybit: %s", pos_mode)
 
     logger.info("Старт: exchange=%s | market=%s | mode=%s | confirm=%s | RSI=%s EMA=%s MACD=%s",
                 Settings.EXCHANGE, Settings.MARKET_TYPE, Settings.RELAX_MODE, Settings.CONFIRM_MODE,
@@ -447,7 +446,7 @@ def main():
 
     while True:
         try:
-            cycle_once(exchange, logger, data_dir, bybit)
+            cycle_once(exchange, logger, data_dir, bybit, pos_mode)
         except Exception as e:
             logger.exception("Критическая ошибка цикла: %s", e)
         finally:
