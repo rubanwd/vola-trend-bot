@@ -1,6 +1,6 @@
 # main.py
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -99,14 +99,19 @@ def find_patterns(df: pd.DataFrame, direction: str) -> List[str]:
 
 
 # =========================
-# State helpers
+# State helpers (signals + last entries)
 # =========================
-def _state_file(data_dir: Path) -> Path:
+def _signals_state_file(data_dir: Path) -> Path:
     return data_dir / "state" / "last_signals.json"
 
+def _entries_state_file(data_dir: Path) -> Path:
+    return data_dir / "state" / "last_entries.json"
+
+def have_prev_signals_state(data_dir: Path) -> bool:
+    return _signals_state_file(data_dir).exists()
 
 def load_last_signals(data_dir: Path) -> List[Dict]:
-    p = _state_file(data_dir)
+    p = _signals_state_file(data_dir)
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -114,12 +119,27 @@ def load_last_signals(data_dir: Path) -> List[Dict]:
             return []
     return []
 
-
 def save_last_signals(data_dir: Path, signals: List[Dict]):
-    p = _state_file(data_dir)
+    p = _signals_state_file(data_dir)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(signals, ensure_ascii=False), encoding="utf-8")
 
+def load_last_entries(data_dir: Path) -> Dict[str, str]:
+    """
+    Возвращает словарь {bybit_symbol: iso_ts_last_entry}
+    """
+    p = _entries_state_file(data_dir)
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def save_last_entries(data_dir: Path, mapping: Dict[str, str]):
+    p = _entries_state_file(data_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(mapping, ensure_ascii=False), encoding="utf-8")
 
 def _signal_key(sig: Dict) -> str:
     return f"{sig['symbol']}|{sig['direction']}"
@@ -135,6 +155,15 @@ def count_open_positions(bybit: BybitAPI) -> int:
     except Exception:
         return 0
 
+def is_symbol_open(bybit: BybitAPI, bybit_symbol: str) -> bool:
+    try:
+        pos = bybit.get_open_positions()
+        for p in pos:
+            if p.get("symbol") == bybit_symbol and abs(float(p.get("size") or 0)) > 0:
+                return True
+        return False
+    except Exception:
+        return False
 
 def last_closed_age_hours(bybit: BybitAPI, bybit_symbol: str) -> float:
     try:
@@ -151,20 +180,39 @@ def last_closed_age_hours(bybit: BybitAPI, bybit_symbol: str) -> float:
     except Exception:
         return 9999.0
 
+def pair_in_cooldown(now_utc: datetime, bybit_symbol: str, last_entries: Dict[str, str], bybit: BybitAPI) -> bool:
+    """
+    True -> вход запрещён.
+    Логика:
+      1) Если у нас есть локальная отметка последнего входа < 24ч — запрещаем.
+      2) Иначе смотрим закрытые позиции на Bybit — если последняя закрыта < 24ч, запрещаем.
+    """
+    hours = Settings.REENTRY_COOLDOWN_HOURS
+    iso = last_entries.get(bybit_symbol)
+    if iso:
+        try:
+            t_local = datetime.fromisoformat(iso)
+            if t_local.tzinfo is None:
+                t_local = t_local.replace(tzinfo=timezone.utc)
+            if (now_utc - t_local).total_seconds() / 3600.0 < hours:
+                return True
+        except Exception:
+            pass
+    # fallback к закрытым сделкам
+    return last_closed_age_hours(bybit, bybit_symbol) < hours
+
 
 def calc_levels_and_qty(
     bybit: BybitAPI, bybit_symbol: str, side: str, df: pd.DataFrame
-) -> Tuple[str, str, float, float]:
+) -> Tuple[str, str, str, str, float]:
     """
-    Возвращает (qty_str, entry_ref_str, tp_str, sl_str)
+    Возвращает (qty_str, entry_ref_str, tp_str, sl_str, atr_val)
     """
     last = bybit.get_last_price(bybit_symbol)
     raw_qty = Settings.POSITION_USD / last
     qty_str = bybit.round_qty(bybit_symbol, raw_qty)
-    # Учитываем минимальную стоимость ордера, если есть
     qty_str = bybit.enforce_min_notional(bybit_symbol, qty_str, last)
 
-    # ATR уровни
     a = float(atr(df, Settings.ATR_LEN).iloc[-1])
     entry_ref = last
     if side == "Buy":
@@ -176,7 +224,7 @@ def calc_levels_and_qty(
 
     sl_str = bybit.round_price(bybit_symbol, sl_f)
     tp_str = bybit.round_price(bybit_symbol, tp_f)
-    return qty_str, str(entry_ref), tp_str, sl_str
+    return qty_str, str(entry_ref), tp_str, sl_str, a
 
 
 def place_with_auto_position_idx(
@@ -186,11 +234,6 @@ def place_with_auto_position_idx(
     qty_str: str,
     pos_mode_hint: str,
 ):
-    """
-    Ставит маркет-ордер и, если получаем ошибку 'position idx not match position mode',
-    делает ОДИН повтор с альтернативным positionIdx.
-    Возвращает кортеж (used_idx:int, final_mode:str).
-    """
     hedge = (pos_mode_hint == "HEDGE")
     idx = 1 if (hedge and side == "Buy") else (2 if hedge and side == "Sell" else 0)
 
@@ -200,9 +243,7 @@ def place_with_auto_position_idx(
     except RuntimeError as e:
         msg = str(e)
         if "position idx not match position mode" not in msg:
-            raise  # это другая ошибка
-
-        # Повторим с альтернативным индексом
+            raise
         alt_idx = 0 if idx in (1, 2) else (1 if side == "Buy" else 2)
         bybit.place_market_order(bybit_symbol, side, qty_str, position_idx=alt_idx)
         return alt_idx, ("HEDGE" if alt_idx in (1, 2) else "ONE_WAY")
@@ -218,7 +259,7 @@ def open_trade_if_ok(
     pos_mode: str,
 ):
     """
-    Открываем сделки по «новым» сигналам с лимитами, ATR SL/TP и анти-реэнтри.
+    Открываем сделки по «новым» сигналам с лимитами, ATR SL/TP, анти-реэнтри и запретом повторного открытия по паре.
     """
     if not new_sigs:
         return
@@ -229,58 +270,65 @@ def open_trade_if_ok(
         logger.info("Лимит позиций достигнут (%d). Входы пропущены.", Settings.MAX_OPEN_POSITIONS)
         return
 
+    last_entries = load_last_entries(data_dir)
+    now_utc = datetime.now(timezone.utc)
+
     for sig in new_sigs[:slots_left]:
         ccxt_symbol = sig["symbol"]
         bybit_symbol = market_id_map.get(ccxt_symbol) or ccxt_symbol.replace("/", "").replace(":USDT", "")
         direction = sig["direction"]
         side = "Buy" if direction == "BULL" else "Sell"
 
-        # анти-реэнтри по закрытым позициям
-        age_h = last_closed_age_hours(bybit, bybit_symbol)
-        if age_h < Settings.REENTRY_COOLDOWN_HOURS:
-            logger.info("Cooldown по %s: %.1fч < %dч — пропускаем.", bybit_symbol, age_h, Settings.REENTRY_COOLDOWN_HOURS)
+        # 0) если уже есть открытая позиция по паре — запрет
+        if is_symbol_open(bybit, bybit_symbol):
+            logger.info("По %s уже есть открытая позиция — вход пропущен.", bybit_symbol)
             continue
 
-        # плечо (best-effort)
+        # 1) кулдаун 24ч по нашей локальной отметке + по закрытым сделкам на Bybit
+        if pair_in_cooldown(now_utc, bybit_symbol, last_entries, bybit):
+            logger.info("Cooldown по %s — менее %d часов с последнего входа/закрытия. Пропуск.",
+                        bybit_symbol, Settings.REENTRY_COOLDOWN_HOURS)
+            continue
+
+        # 2) плечо (best-effort)
         try:
             bybit.set_leverage(bybit_symbol, Settings.LEVERAGE)
         except Exception as e:
             logger.warning("set_leverage %s: %s (продолжаем)", bybit_symbol, e)
 
-        # Проверка данных и уровней
+        # 3) проверка данных
         df = df_cache.get(ccxt_symbol)
         if df is None or len(df) < 20:
             logger.info("Нет df в кэше для %s — пропуск", ccxt_symbol)
             continue
 
+        # 4) уровни и qty
         try:
-            qty_str, entry_ref_str, tp_str, sl_str = calc_levels_and_qty(bybit, bybit_symbol, side, df)
+            qty_str, entry_ref_str, tp_str, sl_str, atr_val = calc_levels_and_qty(bybit, bybit_symbol, side, df)
         except RuntimeError as e:
             logger.error("Подготовка ордера %s: %s", bybit_symbol, e)
             continue
 
-        # Вход (с авто-индексом)
-        used_idx = None
-        final_mode = pos_mode
+        # 5) вход
         try:
             used_idx, final_mode = place_with_auto_position_idx(bybit, bybit_symbol, side, qty_str, pos_mode)
             logger.info("Открыта позиция: %s %s qty=%s (idx=%d, mode=%s)", bybit_symbol, side, qty_str, used_idx, final_mode)
         except RuntimeError as e:
-            msg = str(e)
-            if "Qty invalid" in msg:
-                logger.error("Не удалось открыть позицию %s %s: %s", bybit_symbol, side, e)
-            else:
-                logger.error("Не удалось открыть позицию %s %s: %s", bybit_symbol, side, e)
+            logger.error("Не удалось открыть позицию %s %s: %s", bybit_symbol, side, e)
             continue
 
-        # TP/SL
+        # 6) TP/SL
         try:
-            bybit.set_tp_sl(bybit_symbol, take_profit=tp_str, stop_loss=sl_str, position_idx=(used_idx or 0))
-            logger.info("TP/SL проставлены: TP=%s SL=%s (idx=%d)", tp_str, sl_str, (used_idx or 0))
+            bybit.set_tp_sl(bybit_symbol, take_profit=tp_str, stop_loss=sl_str, position_idx=used_idx)
+            logger.info("TP/SL проставлены: TP=%s SL=%s (idx=%d)", tp_str, sl_str, used_idx)
         except Exception as e:
             logger.warning("Не удалось проставить TP/SL для %s: %s", bybit_symbol, e)
 
-        # Telegram уведомление о сделке
+        # 7) локальная отметка «последний вход по паре»
+        last_entries[bybit_symbol] = now_utc.isoformat(timespec="seconds")
+        save_last_entries(data_dir, last_entries)
+
+        # 8) Telegram уведомление о сделке
         if Settings.TG_TRADE_BOT_TOKEN and Settings.TG_TRADE_CHAT_ID:
             try:
                 pats = ", ".join(sig.get("patterns", [])) or "-"
@@ -294,7 +342,7 @@ def open_trade_if_ok(
                     f"Объём: ${Settings.POSITION_USD} (~ qty {qty_str}) | Плечо x{Settings.LEVERAGE}\n"
                     f"Entry≈: {entry_ref_str}\n"
                     f"SL: {sl_str} | TP: {tp_str}\n"
-                    f"ATR({Settings.ATR_LEN}): {atr(df, Settings.ATR_LEN).iloc[-1]:.4f}\n"
+                    f"ATR({Settings.ATR_LEN}): {atr_val:.4f}\n"
                     f"TF: {Settings.WORK_TF}\n"
                     f"Паттерны: {pats}\n"
                     f"Индикаторы: {flags}\n"
@@ -391,17 +439,21 @@ def cycle_once(exchange, logger, data_dir: Path, bybit: BybitAPI, pos_mode: str)
             logger.warning("Ошибка по %s: %s", sym, e)
 
     # Новые сигналы против прошлой итерации
-    prev = load_last_signals(data_dir)
+    prev_exists = have_prev_signals_state(data_dir)
+    prev = load_last_signals(data_dir) if prev_exists else []
     prev_keys = {_signal_key(s) for s in prev}
     curr_keys = {_signal_key(s) for s in signals}
     new_keys = curr_keys - prev_keys
     new_sigs = [s for s in signals if _signal_key(s) in new_keys]
 
-    # Торговля
-    try:
-        open_trade_if_ok(bybit, logger, data_dir, new_sigs, df_cache, market_id_map, pos_mode)
-    except Exception as e:
-        logger.exception("Trade pipeline error: %s", e)
+    # Торговля: на самом первом запуске — НЕ входим (bootstrap)
+    if not prev_exists:
+        logger.info("Bootstrap: первый запуск — сохраняем список сигналов, входы отключены в этом цикле.")
+    else:
+        try:
+            open_trade_if_ok(bybit, logger, data_dir, new_sigs, df_cache, market_id_map, pos_mode)
+        except Exception as e:
+            logger.exception("Trade pipeline error: %s", e)
 
     # Сохраняем текущее состояние сигналов
     save_last_signals(data_dir, signals)
@@ -477,7 +529,7 @@ def main():
     except Exception as e:
         logger.warning("Не удалось прогреть инструменты Bybit: %s", e)
 
-    # Жёсткий режим из .env (опционально): BYBIT_POSITION_MODE=oneway|hedge|auto
+    # Режим позиций
     pos_mode = bybit.get_position_mode()
     try:
         cfg = getattr(Settings, "BYBIT_POSITION_MODE", "auto").lower()
