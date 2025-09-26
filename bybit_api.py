@@ -3,12 +3,15 @@ import time
 import hmac
 import hashlib
 import json
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from typing import Dict, Any, Optional, List
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, getcontext
+from typing import Dict, Any, Optional, List, Tuple
 
 import requests
 
 from settings import Settings
+
+# Повышаем точность Decimal, чтобы не ловить артефакты на шагах 1e-8
+getcontext().prec = 28
 
 
 class BybitAPI:
@@ -18,9 +21,9 @@ class BybitAPI:
     """
 
     def __init__(self, api_key: str = "", api_secret: str = "", base_url: str = ""):
-        self.api_key = api_key or Settings.BYBIT_API_KEY
-        self.api_secret = api_secret or Settings.BYBIT_API_SECRET
-        self.base = (base_url or Settings.BYBIT_BASE or "https://api-demo.bybit.com").rstrip("/")
+        self.api_key = api_key or getattr(Settings, "BYBIT_API_KEY", "")
+        self.api_secret = api_secret or getattr(Settings, "BYBIT_API_SECRET", "")
+        self.base = (base_url or getattr(Settings, "BYBIT_BASE", "https://api-demo.bybit.com")).rstrip("/")
         self.session = requests.Session()
         self._instruments_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -41,9 +44,6 @@ class BybitAPI:
         }
 
     def _auth_post(self, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Подписанный POST для приватных v5-эндпоинтов.
-        """
         url = f"{self.base}{path}"
         body_str = json.dumps(body or {})
         ts = self._ts()
@@ -85,10 +85,13 @@ class BybitAPI:
             info = self._instruments_cache.get(symbol, {})
         pf = info.get("priceFilter", {}) or {}
         lf = info.get("lotSizeFilter", {}) or {}
+        # Некоторые контракты имеют минимальную стоимость ордера (order value)
+        min_val = lf.get("minOrderValue") or lf.get("minNotionalValue") or "0"
         return {
             "tickSize": str(pf.get("tickSize", "0.01")),
             "qtyStep": str(lf.get("qtyStep", "0.001")),
             "minOrderQty": str(lf.get("minOrderQty", lf.get("qtyStep", "0.001"))),
+            "minOrderValue": str(min_val),
         }
 
     def _quantize(self, value: float, step_str: str, rounding=ROUND_DOWN) -> str:
@@ -112,6 +115,34 @@ class BybitAPI:
         f = self._get_symbol_filters(symbol)
         return self._quantize(price, f["tickSize"], ROUND_HALF_UP)
 
+    def enforce_min_notional(self, symbol: str, qty_str: str, last_price: float) -> str:
+        """
+        Если биржа требует минимальную стоимость ордера — повышаем qty до минимума.
+        """
+        f = self._get_symbol_filters(symbol)
+        try:
+            min_val = Decimal(f["minOrderValue"])
+        except Exception:
+            min_val = Decimal("0")
+        if min_val <= 0:
+            return qty_str
+        val = Decimal(qty_str) * Decimal(str(last_price))
+        if val >= min_val:
+            return qty_str
+        # Требуется поднять количество
+        need = min_val / Decimal(str(last_price))
+        # Квантизируем вверх по qtyStep
+        step = Decimal(f["qtyStep"])
+        # ceil к шагу
+        k = (need / step).to_integral_value(rounding=ROUND_HALF_UP)
+        adj = k * step
+        q = adj if adj > Decimal(qty_str) else (Decimal(qty_str) + step)
+        # Минимум также не ниже minOrderQty
+        min_q = Decimal(f["minOrderQty"])
+        if q < min_q:
+            q = min_q
+        return str(q)
+
     # -------- маркет данные / позиции / ордера --------
     def get_last_price(self, symbol: str) -> float:
         res = self.public_get("/v5/market/tickers", {"category": "linear", "symbol": symbol})
@@ -120,11 +151,19 @@ class BybitAPI:
             raise RuntimeError(f"No ticker for {symbol}")
         return float(lst[0]["lastPrice"])
 
+    # --- Position mode ---
     def get_position_mode(self) -> str:
         """
         Возвращает 'ONE_WAY' или 'HEDGE'.
-        Эвристика: если встречаются positionIdx 1/2 — считаем HEDGE.
+        Эвристика из позиций может врать (когда пусто), поэтому если в Settings
+        задан BYBIT_POSITION_MODE, уважаем его.
         """
+        cfg = getattr(Settings, "BYBIT_POSITION_MODE", "auto").lower()
+        if cfg in ("oneway", "one-way", "one_way", "single"):
+            return "ONE_WAY"
+        if cfg in ("hedge", "both", "both_sides"):
+            return "HEDGE"
+        # auto — пробуем прочитать список позиций
         try:
             res = self._auth_post("/v5/position/list", {"category": "linear"})
             for p in res.get("list", []):
@@ -134,6 +173,17 @@ class BybitAPI:
             return "ONE_WAY"
         except Exception:
             return "ONE_WAY"
+
+    def set_position_mode(self, mode: str) -> None:
+        """
+        Жёстко переключает режим:
+          mode='ONE_WAY' -> 0
+          mode='HEDGE'   -> 3
+        """
+        code = 0 if mode == "ONE_WAY" else 3
+        body = {"category": "linear", "mode": code}
+        # По спецификации нужен coin/symbol для inverse — для linear достаточно category+mode
+        self._auth_post("/v5/position/switch-mode", body)
 
     def get_open_positions(self) -> List[Dict[str, Any]]:
         res = self._auth_post("/v5/position/list", {"category": "linear"})

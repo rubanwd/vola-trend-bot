@@ -2,7 +2,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 
@@ -17,7 +17,7 @@ from bybit_api import BybitAPI
 
 
 # =========================
-# OHLCV helpers (через ccxt для маркет-данных)
+# OHLCV helpers
 # =========================
 def fetch_ohlcv_df(exchange, symbol: str, timeframe: str, limit: int = 300) -> pd.DataFrame:
     ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=min(max(limit, 50), 1000))
@@ -99,7 +99,7 @@ def find_patterns(df: pd.DataFrame, direction: str) -> List[str]:
 
 
 # =========================
-# State helpers (храним «последние сигналы»)
+# State helpers
 # =========================
 def _state_file(data_dir: Path) -> Path:
     return data_dir / "state" / "last_signals.json"
@@ -152,6 +152,62 @@ def last_closed_age_hours(bybit: BybitAPI, bybit_symbol: str) -> float:
         return 9999.0
 
 
+def calc_levels_and_qty(
+    bybit: BybitAPI, bybit_symbol: str, side: str, df: pd.DataFrame
+) -> Tuple[str, str, float, float]:
+    """
+    Возвращает (qty_str, entry_ref_str, tp_str, sl_str)
+    """
+    last = bybit.get_last_price(bybit_symbol)
+    raw_qty = Settings.POSITION_USD / last
+    qty_str = bybit.round_qty(bybit_symbol, raw_qty)
+    # Учитываем минимальную стоимость ордера, если есть
+    qty_str = bybit.enforce_min_notional(bybit_symbol, qty_str, last)
+
+    # ATR уровни
+    a = float(atr(df, Settings.ATR_LEN).iloc[-1])
+    entry_ref = last
+    if side == "Buy":
+        sl_f = entry_ref - Settings.SL_ATR_MULT * a
+        tp_f = entry_ref + Settings.TP_ATR_MULT * a
+    else:
+        sl_f = entry_ref + Settings.SL_ATR_MULT * a
+        tp_f = entry_ref - Settings.TP_ATR_MULT * a
+
+    sl_str = bybit.round_price(bybit_symbol, sl_f)
+    tp_str = bybit.round_price(bybit_symbol, tp_f)
+    return qty_str, str(entry_ref), tp_str, sl_str
+
+
+def place_with_auto_position_idx(
+    bybit: BybitAPI,
+    bybit_symbol: str,
+    side: str,
+    qty_str: str,
+    pos_mode_hint: str,
+):
+    """
+    Ставит маркет-ордер и, если получаем ошибку 'position idx not match position mode',
+    делает ОДИН повтор с альтернативным positionIdx.
+    Возвращает кортеж (used_idx:int, final_mode:str).
+    """
+    hedge = (pos_mode_hint == "HEDGE")
+    idx = 1 if (hedge and side == "Buy") else (2 if hedge and side == "Sell" else 0)
+
+    try:
+        bybit.place_market_order(bybit_symbol, side, qty_str, position_idx=idx)
+        return idx, ("HEDGE" if idx in (1, 2) else "ONE_WAY")
+    except RuntimeError as e:
+        msg = str(e)
+        if "position idx not match position mode" not in msg:
+            raise  # это другая ошибка
+
+        # Повторим с альтернативным индексом
+        alt_idx = 0 if idx in (1, 2) else (1 if side == "Buy" else 2)
+        bybit.place_market_order(bybit_symbol, side, qty_str, position_idx=alt_idx)
+        return alt_idx, ("HEDGE" if alt_idx in (1, 2) else "ONE_WAY")
+
+
 def open_trade_if_ok(
     bybit: BybitAPI,
     logger,
@@ -173,14 +229,11 @@ def open_trade_if_ok(
         logger.info("Лимит позиций достигнут (%d). Входы пропущены.", Settings.MAX_OPEN_POSITIONS)
         return
 
-    hedge = (pos_mode == "HEDGE")
-
     for sig in new_sigs[:slots_left]:
         ccxt_symbol = sig["symbol"]
         bybit_symbol = market_id_map.get(ccxt_symbol) or ccxt_symbol.replace("/", "").replace(":USDT", "")
         direction = sig["direction"]
         side = "Buy" if direction == "BULL" else "Sell"
-        position_idx = 1 if (hedge and side == "Buy") else (2 if hedge and side == "Sell" else 0)
 
         # анти-реэнтри по закрытым позициям
         age_h = last_closed_age_hours(bybit, bybit_symbol)
@@ -194,49 +247,36 @@ def open_trade_if_ok(
         except Exception as e:
             logger.warning("set_leverage %s: %s (продолжаем)", bybit_symbol, e)
 
-        # qty (строка, квантизировано)
-        try:
-            last = bybit.get_last_price(bybit_symbol)
-            raw_qty = Settings.POSITION_USD / last
-            qty_str = bybit.round_qty(bybit_symbol, raw_qty)
-        except Exception as e:
-            logger.error("Не удалось посчитать qty для %s: %s", bybit_symbol, e)
-            continue
-
-        # ATR уровни и цены (строки)
+        # Проверка данных и уровней
         df = df_cache.get(ccxt_symbol)
         if df is None or len(df) < 20:
             logger.info("Нет df в кэше для %s — пропуск", ccxt_symbol)
             continue
 
         try:
-            a = float(atr(df, Settings.ATR_LEN).iloc[-1])
-            entry_ref = last  # реф.цена для расчёта уровней
-            if side == "Buy":
-                sl_f = entry_ref - Settings.SL_ATR_MULT * a
-                tp_f = entry_ref + Settings.TP_ATR_MULT * a
+            qty_str, entry_ref_str, tp_str, sl_str = calc_levels_and_qty(bybit, bybit_symbol, side, df)
+        except RuntimeError as e:
+            logger.error("Подготовка ордера %s: %s", bybit_symbol, e)
+            continue
+
+        # Вход (с авто-индексом)
+        used_idx = None
+        final_mode = pos_mode
+        try:
+            used_idx, final_mode = place_with_auto_position_idx(bybit, bybit_symbol, side, qty_str, pos_mode)
+            logger.info("Открыта позиция: %s %s qty=%s (idx=%d, mode=%s)", bybit_symbol, side, qty_str, used_idx, final_mode)
+        except RuntimeError as e:
+            msg = str(e)
+            if "Qty invalid" in msg:
+                logger.error("Не удалось открыть позицию %s %s: %s", bybit_symbol, side, e)
             else:
-                sl_f = entry_ref + Settings.SL_ATR_MULT * a
-                tp_f = entry_ref - Settings.TP_ATR_MULT * a
-
-            sl_str = bybit.round_price(bybit_symbol, sl_f)
-            tp_str = bybit.round_price(bybit_symbol, tp_f)
-        except Exception as e:
-            logger.error("ATR/levels error %s: %s", bybit_symbol, e)
+                logger.error("Не удалось открыть позицию %s %s: %s", bybit_symbol, side, e)
             continue
 
-        # Маркет-вход с корректным positionIdx
+        # TP/SL
         try:
-            bybit.place_market_order(bybit_symbol, side, qty_str, position_idx=position_idx)
-            logger.info("Открыта позиция: %s %s qty=%s (idx=%d)", bybit_symbol, side, qty_str, position_idx)
-        except Exception as e:
-            logger.error("Не удалось открыть позицию %s %s: %s", bybit_symbol, side, e)
-            continue
-
-        # TP/SL на позицию
-        try:
-            bybit.set_tp_sl(bybit_symbol, take_profit=tp_str, stop_loss=sl_str, position_idx=position_idx)
-            logger.info("TP/SL проставлены: TP=%s SL=%s (idx=%d)", tp_str, sl_str, position_idx)
+            bybit.set_tp_sl(bybit_symbol, take_profit=tp_str, stop_loss=sl_str, position_idx=(used_idx or 0))
+            logger.info("TP/SL проставлены: TP=%s SL=%s (idx=%d)", tp_str, sl_str, (used_idx or 0))
         except Exception as e:
             logger.warning("Не удалось проставить TP/SL для %s: %s", bybit_symbol, e)
 
@@ -249,12 +289,12 @@ def open_trade_if_ok(
                 text = (
                     "✅ ОТКРЫТА СДЕЛКА\n"
                     f"Пара: {ccxt_symbol} (Bybit: {bybit_symbol})\n"
-                    f"Режим позиций: {pos_mode} (idx={position_idx})\n"
+                    f"Режим позиций: {final_mode} (idx={used_idx})\n"
                     f"Направление: {'LONG' if side=='Buy' else 'SHORT'}\n"
                     f"Объём: ${Settings.POSITION_USD} (~ qty {qty_str}) | Плечо x{Settings.LEVERAGE}\n"
-                    f"Entry≈: {entry_ref}\n"
+                    f"Entry≈: {entry_ref_str}\n"
                     f"SL: {sl_str} | TP: {tp_str}\n"
-                    f"ATR({Settings.ATR_LEN}): {a:.4f}\n"
+                    f"ATR({Settings.ATR_LEN}): {atr(df, Settings.ATR_LEN).iloc[-1]:.4f}\n"
                     f"TF: {Settings.WORK_TF}\n"
                     f"Паттерны: {pats}\n"
                     f"Индикаторы: {flags}\n"
@@ -267,7 +307,7 @@ def open_trade_if_ok(
 
 
 # =========================
-# Optional: anomaly filter (пампы/дампы)
+# Optional: anomaly filter
 # =========================
 def pass_anomaly_filter(exchange, symbol: str) -> bool:
     if not Settings.ANOMALY_FILTER_ENABLED:
@@ -437,9 +477,20 @@ def main():
     except Exception as e:
         logger.warning("Не удалось прогреть инструменты Bybit: %s", e)
 
+    # Жёсткий режим из .env (опционально): BYBIT_POSITION_MODE=oneway|hedge|auto
     pos_mode = bybit.get_position_mode()
-    logger.info("Режим позиций Bybit: %s", pos_mode)
+    try:
+        cfg = getattr(Settings, "BYBIT_POSITION_MODE", "auto").lower()
+        if cfg in ("oneway", "one-way", "one_way", "single"):
+            bybit.set_position_mode("ONE_WAY")
+            pos_mode = "ONE_WAY"
+        elif cfg in ("hedge", "both", "both_sides"):
+            bybit.set_position_mode("HEDGE")
+            pos_mode = "HEDGE"
+    except Exception as e:
+        logger.warning("Не удалось переключить режим позиций: %s (используем %s)", e, pos_mode)
 
+    logger.info("Режим позиций Bybit: %s", pos_mode)
     logger.info("Старт: exchange=%s | market=%s | mode=%s | confirm=%s | RSI=%s EMA=%s MACD=%s",
                 Settings.EXCHANGE, Settings.MARKET_TYPE, Settings.RELAX_MODE, Settings.CONFIRM_MODE,
                 Settings.ENABLE_RSI, Settings.ENABLE_EMA, Settings.ENABLE_MACD)
